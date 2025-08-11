@@ -2,21 +2,32 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <title>火线突击｜Fireline（原型 · Phase 0-2 扩展）</title>
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
   <script>
-    // 移动端自动全屏并强制横屏
+    // 移动端自动全屏并强制横屏，兼容主流浏览器
     document.addEventListener('DOMContentLoaded', function() {
       function isMobile() {
         return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
       }
-      if (isMobile() && screen.orientation && screen.orientation.lock) {
-        screen.orientation.lock('landscape').catch(()=>{});
+      function tryLockOrientation() {
+        if (screen.orientation && screen.orientation.lock) {
+          screen.orientation.lock('landscape').catch(()=>{});
+        } else if (window.screen.lockOrientationUniversal) {
+          window.screen.lockOrientationUniversal('landscape');
+        }
       }
-      if (isMobile() && document.documentElement.requestFullscreen) {
+      if (isMobile()) {
         setTimeout(()=>{
-          document.documentElement.requestFullscreen().catch(()=>{});
+          tryLockOrientation();
+          // iOS Safari 需用户手势触发全屏，Android部分浏览器可自动
+          if (document.documentElement.requestFullscreen) {
+            document.documentElement.requestFullscreen().catch(()=>{});
+          }
         }, 500);
+        // 监听屏幕旋转，自动尝试横屏
+        window.addEventListener('orientationchange', tryLockOrientation);
       }
     });
   </script>
@@ -124,13 +135,49 @@
 
 <script>
 (() => {
-  // 房间发现与加入逻辑
-  const roomSection = document.getElementById('roomSection');
-  const roomList = document.getElementById('roomList');
-  const refreshRooms = document.getElementById('refreshRooms');
-  let discoveredRooms = [];
-
-  function showRooms(rooms) {
+  // 页面加载后自动显示房间UI
+  document.addEventListener('DOMContentLoaded', function() {
+    const roomSection = document.getElementById('roomSection');
+    if(roomSection) roomSection.style.display = 'block';
+  });
+  // ===== WebSocket 局域网联机核心 =====
+  let ws = null;
+let remotePlayers = [];
+  let myPlayerId = Math.random().toString(36).slice(2);
+  let myName = '玩家' + myPlayerId.slice(-4);
+  let currentRoomId = null;
+  let isHost = false;
+  function connectWS() {
+    // 自动连接本地服务器
+  let host = location.hostname || 'localhost';
+  if (!host || host === '') host = 'localhost';
+  let url = localStorage.getItem('fireline_server') || `ws://${host}:3000`;
+  ws = new WebSocket(url);
+    ws.onopen = ()=>{ console.log('已连接局域网服务器'); };
+    ws.onmessage = (e)=>{
+      let msg;
+      try{ msg=JSON.parse(e.data); }catch{return;}
+      if(msg.type==='roomList') updateRoomList(msg.rooms);
+      if(msg.type==='roomCreated'){ currentRoomId=msg.roomId; isHost=true; menu.style.display='none'; startGame(); }
+      if(msg.type==='joined'){ currentRoomId=msg.roomId; isHost=false; menu.style.display='none'; startGame(); }
+      if(msg.type==='playerJoin'){
+        tip(msg.name+' 加入了房间');
+        // 主机收到新玩家加入，立即同步所有玩家
+        if(isHost) {
+          // 收集所有玩家（主机和remotePlayers）
+          const allPlayers = [
+            { id: myPlayerId, name: myName, x: player.x, y: player.y, r: player.r, color: player.color, hp: player.hp, hpMax: player.hpMax, alive: player.alive },
+            ...remotePlayers.filter(p=>p.id!==myPlayerId)
+          ];
+          syncToOthers({ remotePlayers: allPlayers });
+        }
+      }
+      if(msg.type==='playerLeave'){ tip('有玩家离开'); }
+      if(msg.type==='sync' && !isHost){ onSyncFromHost(msg.data); }
+    };
+    ws.onclose = ()=>{ tip('与服务器断开'); };
+  }
+  function updateRoomList(rooms) {
     roomList.innerHTML = '';
     if (!rooms || rooms.length === 0) {
       roomList.innerHTML = '<span style="opacity:.7">暂无可加入的对局</span>';
@@ -140,42 +187,64 @@
       const btn = document.createElement('button');
       btn.className = 'primary';
       btn.textContent = `加入房间：${room.name}`;
-      btn.onclick = () => joinRoom(room);
+      btn.onclick = () => joinRoomWS(room);
       roomList.appendChild(btn);
     });
   }
-
-  function discoverRooms() {
-    // TODO: 替换为实际网络发现逻辑
-    // 这里模拟发现2个房间
-    discoveredRooms = [
-      { id: 'room1', name: '局域网对局A', players: 2 },
-      { id: 'room2', name: '局域网对局B', players: 1 }
-    ];
-    showRooms(discoveredRooms);
-    roomSection.style.display = 'block';
+  function createRoomWS() {
+    ws.send(JSON.stringify({ type:'createRoom', name:myName, playerId:myPlayerId }));
   }
-
-  function joinRoom(room) {
-    // TODO: 替换为实际加入房间逻辑
-    alert('已加入房间：' + room.name + '\n(此为前端演示，需对接后端/信令)');
-    // 加入后可隐藏菜单，进入游戏等
-    // menu.style.display = 'none';
+  function joinRoomWS(room) {
+    ws.send(JSON.stringify({ type:'joinRoom', roomId:room.id, name:myName, playerId:myPlayerId }));
   }
+  function syncToOthers(data) {
+    if(ws && isHost && currentRoomId) {
+      ws.send(JSON.stringify({ type:'sync', data, playerId:myPlayerId }));
+    }
+  }
+  function onSyncFromHost(data) {
+    // 客户端同步主机数据
+    if(data && data.remotePlayers) {
+      remotePlayers = data.remotePlayers;
+    }
+  }
+  // 页面加载自动连接
+  setTimeout(connectWS, 200);
+  // 房间发现与加入逻辑
+  const roomSection = document.getElementById('roomSection');
+  const roomList = document.getElementById('roomList');
+  const refreshRooms = document.getElementById('refreshRooms');
+  let discoveredRooms = [];
 
-  refreshRooms.onclick = discoverRooms;
-  // 页面加载自动发现
-  setTimeout(discoverRooms, 300);
+  // 覆盖房间发现与加入逻辑，使用WebSocket
+  refreshRooms.onclick = ()=>{ if(ws) ws.send(JSON.stringify({ type:'getRooms' })); };
+  // 新增“创建房间”按钮
+  if(roomSection && !document.getElementById('createRoomBtn')) {
+    const btn = document.createElement('button');
+    btn.id = 'createRoomBtn';
+    btn.className = 'primary';
+    btn.textContent = '创建新房间';
+    btn.onclick = createRoomWS;
+    roomSection.insertBefore(btn, roomList);
+  }
   // canvas自适应窗口
+  // 采用固定逻辑分辨率，显示时自适应缩放，避免内容变形
+  const LOGIC_W = 960, LOGIC_H = 720;
   function resizeGameCanvas() {
     const canvas = document.getElementById('game');
-    let w = window.innerWidth, h = window.innerHeight;
-    // 保持16:12比例
-    let ratio = 960/720;
-    if (w/h > ratio) { w = h * ratio; } else { h = w / ratio; }
-    canvas.width = w; canvas.height = h;
+    // 只设置CSS宽高，不改变canvas.width/height
+    let ww = window.innerWidth, wh = window.innerHeight;
+    let ratio = LOGIC_W / LOGIC_H;
+    let dw = ww, dh = wh;
+    if (ww/wh > ratio) { dw = wh * ratio; dh = wh; } else { dh = ww / ratio; dw = ww; }
+    canvas.style.width = dw + 'px';
+    canvas.style.height = dh + 'px';
   }
   window.addEventListener('resize', resizeGameCanvas);
+  // 初始化canvas逻辑分辨率
+  const canvas = document.getElementById('game');
+  canvas.width = LOGIC_W;
+  canvas.height = LOGIC_H;
   resizeGameCanvas();
   /** 配置（可外置成JSON） **/
   const CONFIG = {
@@ -221,7 +290,8 @@
   ];
 
   /** DOM **/
-  const canvas = document.getElementById('game');
+  // ...existing code...
+  // 逻辑分辨率下的渲染上下文
   const ctx = canvas.getContext('2d');
   const mini = document.getElementById('minimap');
   const mctx = mini.getContext('2d');
@@ -283,7 +353,16 @@
   /** 事件 **/
   window.addEventListener('keydown',e=>{ keys[e.key.toLowerCase()]=true; if(e.key===' '){e.preventDefault();} });
   window.addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
-  canvas.addEventListener('mousemove',e=>{const r=canvas.getBoundingClientRect(); input.mx=e.clientX-r.left; input.my=e.clientY-r.top;});
+  canvas.addEventListener('mousemove',e=>{
+    const r=canvas.getBoundingClientRect();
+    input.mx = e.clientX - r.left;
+    input.my = e.clientY - r.top;
+    // 实时记录世界坐标
+    input.worldX = cam.x + input.mx;
+    input.worldY = cam.y + input.my;
+  });
+  // 鼠标离开canvas时，准心消失
+  canvas.addEventListener('mouseleave',()=>{input.mx=undefined;input.my=undefined;input.worldX=undefined;input.worldY=undefined;});
   canvas.addEventListener('mousedown',()=>input.shooting=true);
   window.addEventListener('mouseup',()=>input.shooting=false);
 
@@ -308,8 +387,22 @@
   bindStick(stickR, knobR, stickRState, ()=>{ input.shooting=true; }, ()=>{ input.shooting=false; });
 
   function bindStick(el, knob, state, onStartExtra, onEndExtra){
+    const isRightStick = (el.id === 'stickR');
     const onStart = (e)=>{ state.active=true; const t=e.touches?e.touches[0]:e; state.sx=t.clientX; state.sy=t.clientY; onStartExtra&&onStartExtra(); e.preventDefault(); };
-    const onMove = (e)=>{ if(!state.active) return; const t=e.touches?e.touches[0]:e; const dx=t.clientX-state.sx, dy=t.clientY-state.sy; const len=Math.hypot(dx,dy); const c=len>stickRadius?stickRadius/len:1; state.dx=dx*c; state.dy=dy*c; knob.style.transform=`translate(calc(-50% + ${state.dx}px), calc(-50% + ${state.dy}px))`; e.preventDefault(); };
+    const onMove = (e)=>{
+      if(!state.active) return;
+      const t=e.touches?e.touches[0]:e;
+      let dx=t.clientX-state.sx, dy=t.clientY-state.sy;
+      // 右摇杆方向修正：与手指方向一致（即右摇杆为相对中心的方向）
+      if(isRightStick) {
+        const rect = el.getBoundingClientRect();
+        dx = t.clientX - (rect.left + rect.width/2);
+        dy = t.clientY - (rect.top + rect.height/2);
+      }
+      const len=Math.hypot(dx,dy); const c=len>stickRadius?stickRadius/len:1; state.dx=dx*c; state.dy=dy*c;
+      knob.style.transform=`translate(calc(-50% + ${state.dx}px), calc(-50% + ${state.dy}px))`;
+      e.preventDefault();
+    };
     const onEnd  = ()=>{ state.active=false; state.dx=state.dy=0; knob.style.transform='translate(-50%,-50%)'; onEndExtra&&onEndExtra(); };
     el.addEventListener('touchstart',onStart,{passive:false});
     el.addEventListener('touchmove',onMove,{passive:false});
@@ -362,6 +455,15 @@
 
     bullets=[]; grenades=[]; explosions=[]; smokes=[]; killCount=0; lastTime=performance.now(); timeStart=lastTime;
     zone.r = CONFIG.danger.radiusStart; zone.phase=0; zone.nextT = timeStart + CONFIG.danger.phases[0];
+    // 主机定时同步玩家数据
+    if(isHost) setInterval(()=>{
+      // 收集所有玩家（主机和remotePlayers）
+      const allPlayers = [
+        { id: myPlayerId, name: myName, x: player.x, y: player.y, r: player.r, color: player.color, hp: player.hp, hpMax: player.hpMax, alive: player.alive },
+        ...remotePlayers.filter(p=>p.id!==myPlayerId)
+      ];
+      syncToOthers({ remotePlayers: allPlayers });
+    }, 100);
     requestAnimationFrame(loop);
     tip('目标：'+ selectedMode.name +'！红:回血 蓝:弹药 紫:武器');
   }
@@ -382,7 +484,10 @@
   function createAgent(x,y,color,hp,speed,isPlayer, team){
     return { x,y,r:18,color,hp,hpMax:hp,speed,alive:true, team:team||2,
       primary:'pistol', weapon:null, mag:0, reserve:0, lastFire:0, reloadEnd:0,
-      state:'patrol', target:null, vx:0, vy:0 };
+      state:'patrol', target:null, vx:0, vy:0, name: name };
+  player = createAgent(800,700, base.color, base.hp, base.speed, true, 1, myName);
+  const ally = createAgent(900,760, '#79ffd1', 95, 2.4, false, 1, '队友');
+  list.forEach(s=>{ const e=createAgent(s.x,s.y,s.c,90,2.2,false, team, s.name || '敌人'); e.primary='rifle'; e.weapon=CONFIG.weapons[e.primary]; e.mag=e.weapon.mag; e.reserve=90; enemies.push(e); });
   }
 
   function equip(id){
@@ -402,10 +507,20 @@
   }
 
   /** 主循环 **/
-  function loop(t){ const dt = Math.min(48, t - lastTime); lastTime=t; update(dt,t); render(); if(result.style.display!=='flex') requestAnimationFrame(loop); }
+  // 修正高刷新率下dt过小导致游戏加速问题，dt基于真实时间，最大不超过40ms
+  function loop(t){
+    let dt = t - lastTime;
+    if (!lastTime) dt = 16.7; // 首帧
+    dt = Math.max(10, Math.min(40, dt)); // 限制dt范围，防止过快或过慢
+    lastTime = t;
+    update(dt, t);
+    render();
+    if(result.style.display!=='flex') requestAnimationFrame(loop);
+  }
 
   /** 更新 **/
   function update(dt,t){
+
     // 输入/移动
     let mx=0,my=0; if(keys['w']||keys['arrowup']) my-=1; if(keys['s']||keys['arrowdown']) my+=1; if(keys['a']||keys['arrowleft']) mx-=1; if(keys['d']||keys['arrowright']) mx+=1;
     if(stickLState.active){ mx += stickLState.dx/ stickRadius; my += stickLState.dy/ stickRadius;}
@@ -417,8 +532,37 @@
     tryMove(player, player.vx, player.vy);
 
     // 瞄准角度
-    let ax,ay; if(stickRState.active){ ax = player.x - cam.x + (stickRState.dx*2); ay = player.y - cam.y + (stickRState.dy*2);} else { ax=input.mx; ay=input.my; }
-    const dx = ax - (player.x - cam.x), dy = ay - (player.y - cam.y); input.aimAngle = Math.atan2(dy,dx);
+    let ax, ay;
+    if(player.alive) {
+      if(stickRState.active){
+        ax = player.x - cam.x + (stickRState.dx*2);
+        ay = player.y - cam.y + (stickRState.dy*2);
+        // 右摇杆优先，依然用canvas坐标+摄像机
+        input.aimAngle = Math.atan2((cam.y + ay) - player.y, (cam.x + ax) - player.x);
+      } else {
+        // 鼠标优先，始终根据当前准心位置实时计算
+        let wx, wy;
+        if (typeof input.mx === 'number' && typeof input.my === 'number') {
+          wx = cam.x + input.mx;
+          wy = cam.y + input.my;
+        } else if (input.worldX !== undefined && input.worldY !== undefined) {
+          wx = input.worldX;
+          wy = input.worldY;
+        } else {
+          wx = player.x;
+          wy = player.y;
+        }
+        input.aimAngle = Math.atan2(wy - player.y, wx - player.x);
+      }
+    }
+
+    // 只有玩家死亡时才重置摇杆和射击状态
+    if(!player.alive) {
+      stickRState.active = false;
+      stickRState.dx = 0;
+      stickRState.dy = 0;
+      input.shooting = false;
+    }
 
     // 换弹完成
     if(player.reloadEnd && t>=player.reloadEnd){ player.mag = player._pendingMag; player.reserve = player._pendingReserve; player.reloadEnd=0; tip('换弹完成'); }
@@ -437,14 +581,32 @@
     // AI：敌我识别 + 视野/掩体 + 射击
     const allAgents = (selectedMode.id==='team2') ? [...allies, ...enemies] : enemies;
     allAgents.forEach(e=>{
-      if(!e.alive) return; const target = findTargetFor(e); if(!target) return;
+      if(!e.alive) return;
+      // AI换弹机制
+      if(e.reloadEnd && t >= e.reloadEnd){ e.mag = e._pendingMag; e.reserve = e._pendingReserve; e.reloadEnd = 0; }
+      // 目标选择
+      const target = findTargetFor(e);
+      if(!target) return;
       // 追击/移动
       const see = canSee(e, target); const dist = Math.hypot(target.x-e.x, target.y-e.y);
-      if(see){ // 直线逼近
+      if(see){
         const ang=Math.atan2(target.y-e.y, target.x-e.x); tryMove(e, Math.cos(ang)*e.speed*0.9, Math.sin(ang)*e.speed*0.9);
         // 射击（CD）
-        const w = CONFIG.weapons[e.primary]; const cd = 60000 / w.rpm; if(t - e.lastFire >= cd){ const aim = leadAim(e, target, w.bulletSpeed); fireBullet(e, aim, w, false); e.lastFire=t; if(e.mag>0) e.mag--; else { e.mag=w.mag; } }
-      } else { // 巡逻到随机点
+        const w = CONFIG.weapons[e.primary];
+        const cd = 60000 / w.rpm;
+        if(!e.reloadEnd && t - e.lastFire >= cd && e.mag > 0){
+          const aim = leadAim(e, target, w.bulletSpeed);
+          fireBullet(e, aim, w, false);
+          e.lastFire = t;
+          e.mag--;
+          if(e.mag <= 0 && (e.reserve === undefined || e.reserve > 0)){
+            // AI换弹
+            e.reloadEnd = t + w.reload;
+            e._pendingMag = w.mag;
+            e._pendingReserve = (e.reserve === undefined ? 999 : Math.max(0, (e.reserve||999) - w.mag));
+          }
+        }
+      } else {
         if(!e.target || Math.hypot(e.target.x-e.x,e.target.y-e.y)<40){ e.target={x:e.x+(Math.random()*800-400), y:e.y+(Math.random()*800-400)}; e.target.x=clamp(e.target.x,100,MAP_W-100); e.target.y=clamp(e.target.y,100,MAP_H-100); }
         const ang=Math.atan2(e.target.y-e.y, e.target.x-e.x); tryMove(e, Math.cos(ang)*e.speed*0.7, Math.sin(ang)*e.speed*0.7);
       }
@@ -471,10 +633,27 @@
 
     // 手雷：高爆/烟雾
     grenades.forEach(g=>{
+      // 手雷/烟雾弹物理：加摩擦和地面检测
       if(g.kind==='frag'){
-        const gCfg = CONFIG.grenade; g.x += g.vx; g.y += g.vy; if(t - g.born >= gCfg.fuse){ g.boom=true; makeExplosion(g.x,g.y); }
+        const gCfg = CONFIG.grenade;
+        g.vx *= 0.98; g.vy *= 0.98; // 摩擦
+        g.vy += 0.18; // 重力
+        g.x += g.vx; g.y += g.vy;
+        // 地面反弹
+        if(g.y > MAP_H-12) { g.y = MAP_H-12; g.vy *= -0.45; g.vx *= 0.7; }
+        if(g.x < 12) { g.x = 12; g.vx *= -0.45; }
+        if(g.x > MAP_W-12) { g.x = MAP_W-12; g.vx *= -0.45; }
+        // 爆炸
+        if(t - g.born >= gCfg.fuse){ g.boom=true; makeExplosion(g.x,g.y); }
       } else {
-        const sCfg = CONFIG.smoke; g.x += g.vx; g.y += g.vy; if(t - g.born >= sCfg.fuse){ g.boom=true; smokes.push({x:g.x,y:g.y,r:sCfg.radius, life:sCfg.life}); }
+        const sCfg = CONFIG.smoke;
+        g.vx *= 0.98; g.vy *= 0.98;
+        g.vy += 0.18;
+        g.x += g.vx; g.y += g.vy;
+        if(g.y > MAP_H-12) { g.y = MAP_H-12; g.vy *= -0.45; g.vx *= 0.7; }
+        if(g.x < 12) { g.x = 12; g.vx *= -0.45; }
+        if(g.x > MAP_W-12) { g.x = MAP_W-12; g.vx *= -0.45; }
+        if(t - g.born >= sCfg.fuse){ g.boom=true; smokes.push({x:g.x,y:g.y,r:sCfg.radius, life:sCfg.life}); }
       }
     });
     grenades = grenades.filter(g=>!g.boom);
@@ -495,24 +674,47 @@
     // 拾取
     pickups.forEach(p=>{ if(p.taken) return; if(Math.hypot(player.x-p.x,player.y-p.y)<player.r+p.r){ p.taken=true; if(p.type==='hp'){ player.hp=Math.min(player.hpMax, player.hp+30); tip('生命+30'); } else if(p.type==='ammo'){ player.reserve+=30; tip('备用弹药+30'); } else if(p.type==='weapon'){ equip(p.weapon); tip('获得武器：'+CONFIG.weapons[p.weapon].name); } } });
 
-    // 危险圈
-    if(CONFIG.danger.enabled){ if(t>=zone.nextT && zone.phase < CONFIG.danger.phases.length){ zone.phase++; zone.nextT = t + (CONFIG.danger.phases[zone.phase]||999999); }
+    // 危险圈逻辑按模式区分
+    if(selectedMode.id==='ffa'){
+      // 自由混战无缩圈
+      CONFIG.danger.enabled = false;
+    }else if(selectedMode.id==='surv'){
+      // 大逃杀模式有缩圈
+      CONFIG.danger.enabled = true;
+      if(t>=zone.nextT && zone.phase < CONFIG.danger.phases.length){ zone.phase++; zone.nextT = t + (CONFIG.danger.phases[zone.phase]||999999); }
       const targetR = CONFIG.danger.radiusStart / Math.pow(2, zone.phase); zone.r += (targetR - zone.r) * 0.006 * (dt/16);
       const d=Math.hypot(player.x-zone.center.x, player.y-zone.center.y); if(d>zone.r){ player.hp -= CONFIG.danger.tickDamage*(dt/1000); if(player.hp<=0){ player.alive=false; } }
+    }else if(selectedMode.id==='team2'){
+      // 小队模式无缩圈
+      CONFIG.danger.enabled = false;
     }
 
-    // 生存模式：刷波
-    if(selectedMode.id==='surv'){
-      if(t>=wave.nextT && enemies.every(e=>!e.alive)){
-        wave.idx++; const n = 2 + wave.idx*2; const sp = [];
-        for(let i=0;i<n;i++){ sp.push({x: 3400+Math.random()*2000, y: 1200+Math.random()*2200, c:'#ffd166'}); }
-        spawnEnemies(sp,2); tip('第 '+wave.idx+' 波来了！');
-        wave.nextT = t + Math.max(4000, 12000 - wave.idx*1200);
+    // 模式信息与复活逻辑
+    if(selectedMode.id==='ffa'){
+      modeInfo.textContent = '自由混战：无限复活，击败所有敌人';
+      // 死亡后自动复活
+      if(!player.alive){
+        setTimeout(()=>{
+          player.x = 800 + Math.random()*4000;
+          player.y = 700 + Math.random()*3000;
+          player.hp = player.hpMax;
+          player.alive = true;
+        }, 1200);
       }
-      modeInfo.textContent = `生存波次：第 ${wave.idx} 波`;
-    } else if(selectedMode.id==='team2'){
-      modeInfo.textContent = `2v2 小队：我方 ${aliveCount([player,...allies])} 人 / 敌方 ${aliveCount(enemies)} 人`;
-    } else { modeInfo.textContent = ''; }
+    }else if(selectedMode.id==='surv'){
+      modeInfo.textContent = '大逃杀：有缩圈，死亡淘汰，最后一人生存';
+      // 死亡不复活
+    }else if(selectedMode.id==='team2'){
+      modeInfo.textContent = `2v2 小队：无限复活`; 
+      if(!player.alive){
+        setTimeout(()=>{
+          player.x = 800 + Math.random()*4000;
+          player.y = 700 + Math.random()*3000;
+          player.hp = player.hpMax;
+          player.alive = true;
+        }, 1200);
+      }
+    }
 
     // 摄像机 & HUD
     cam.x = clamp(player.x - canvas.width/2, 0, MAP_W - canvas.width);
@@ -529,13 +731,19 @@
   function finish(){ if(result.style.display==='flex') return; const win = player.alive && enemies.every(e=>!e.alive); resTitle.textContent = win? '胜利！' : '你阵亡了'; const time = ((lastTime - timeStart)/1000).toFixed(1); resDesc.textContent = `用时 ${time}s；击杀 ${killCount}`; result.style.display='flex'; }
 
   /** 渲染 **/
+  // 隐藏系统鼠标指针
+  canvas.style.cursor = 'none';
   function render(){
+  // ...（其余渲染代码保持不变）
+    // 渲染前缩放到逻辑分辨率
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,LOGIC_W,LOGIC_H);
     // 地面
-    ctx.fillStyle='#0d1228'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle='#0d1228'; ctx.fillRect(0,0,LOGIC_W,LOGIC_H);
     // 网格
     const grid=80; ctx.strokeStyle='#141a3a'; ctx.lineWidth=1; ctx.beginPath();
-    for(let x=-(cam.x%grid); x<canvas.width; x+=grid){ ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); }
-    for(let y=-(cam.y%grid); y<canvas.height; y+=grid){ ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); }
+    for(let x=-(cam.x%grid); x<LOGIC_W; x+=grid){ ctx.moveTo(x,0); ctx.lineTo(x,LOGIC_H); }
+    for(let y=-(cam.y%grid); y<LOGIC_H; y+=grid){ ctx.moveTo(0,y); ctx.lineTo(LOGIC_W,y); }
     ctx.stroke();
 
     // 危险圈
@@ -563,21 +771,58 @@
     explosions.forEach(ex=>{ const alpha = ex.life/420; const grd = ctx.createRadialGradient(ex.x - cam.x, ex.y - cam.y, 0, ex.x - cam.x, ex.y - cam.y, ex.r); grd.addColorStop(0, `rgba(255,214,102,${alpha})`); grd.addColorStop(1, 'rgba(255,214,102,0)'); ctx.fillStyle=grd; ctx.beginPath(); ctx.arc(ex.x - cam.x, ex.y - cam.y, ex.r, 0, Math.PI*2); ctx.fill(); });
 
     // 角色
-    enemies.forEach(e=>{ if(!e.alive) return; drawAgent(e, e.color); });
-    allies.forEach(a=>{ if(!a.alive) return; drawAgent(a, '#79ffd1'); });
-    if(player.alive) drawAgent(player, selectedMode.id==='team2' ? '#9fd1ff' : player.color, input.aimAngle, true);
+  enemies.forEach(e=>{ if(!e.alive) return; drawAgent(e, e.color, undefined, false, e.name || '敌人'); });
+  allies.forEach(a=>{ if(!a.alive) return; drawAgent(a, '#79ffd1', undefined, false, a.name || '队友'); });
+  if(player.alive) drawAgent(player, selectedMode.id==='team2' ? '#9fd1ff' : player.color, input.aimAngle, true, player.name || myName || '玩家');
+  // 渲染远程玩家
+  if(remotePlayers && remotePlayers.length) {
+    remotePlayers.forEach(p=>{
+      if(p.alive) drawAgent(p, p.color, undefined, false, p.name || '玩家');
+    });
+  }
 
     // 视野遮罩（玩家 FoV）
     drawFOVMask();
 
     // 迷你地图
     drawMinimap();
+
+    // 绘制自定义圆形准心（仅PC端，且鼠标在canvas内时）
+    if(typeof input.mx === 'number' && typeof input.my === 'number'){
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(input.mx, input.my, 13, 0, Math.PI*2);
+      ctx.lineWidth = 2.5;
+      ctx.strokeStyle = '#fff';
+      ctx.shadowColor = '#222';
+      ctx.shadowBlur = 2;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(input.mx, input.my, 4, 0, Math.PI*2);
+      ctx.fillStyle = '#fff';
+      ctx.globalAlpha = 0.7;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
   }
 
   function drawAgent(a,color,facing,isPlayer){
-    ctx.beginPath(); ctx.arc(a.x - cam.x, a.y - cam.y, a.r, 0, Math.PI*2); ctx.fillStyle=color; ctx.fill();
-    const angle = facing ?? 0; ctx.beginPath(); ctx.moveTo(a.x - cam.x, a.y - cam.y); ctx.lineTo(a.x - cam.x + Math.cos(angle)*a.r, a.y - cam.y + Math.sin(angle)*a.r); ctx.strokeStyle='#e7e9f1'; ctx.lineWidth=2; ctx.stroke();
-    const w=36,h=6; ctx.fillStyle='#20274f'; ctx.fillRect(a.x - cam.x - w/2, a.y - cam.y - a.r - 14, w, h); ctx.fillStyle='#ff4d5a'; ctx.fillRect(a.x - cam.x - w/2, a.y - cam.y - a.r - 14, w*(a.hp/a.hpMax), h);
+  ctx.beginPath(); ctx.arc(a.x - cam.x, a.y - cam.y, a.r, 0, Math.PI*2); ctx.fillStyle=color; ctx.fill();
+  const angle = facing ?? 0; ctx.beginPath(); ctx.moveTo(a.x - cam.x, a.y - cam.y); ctx.lineTo(a.x - cam.x + Math.cos(angle)*a.r, a.y - cam.y + Math.sin(angle)*a.r); ctx.strokeStyle='#e7e9f1'; ctx.lineWidth=2; ctx.stroke();
+  const w=36,h=6; ctx.fillStyle='#20274f'; ctx.fillRect(a.x - cam.x - w/2, a.y - cam.y - a.r - 14, w, h); ctx.fillStyle='#ff4d5a'; ctx.fillRect(a.x - cam.x - w/2, a.y - cam.y - a.r - 14, w*(a.hp/a.hpMax), h);
+  // 始终在血条上方显示名字
+  let displayName = a.name || a.playerName || a.id || '玩家';
+  ctx.save();
+  ctx.font = 'bold 15px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#222';
+  ctx.lineWidth = 3;
+  ctx.strokeText(displayName, a.x - cam.x, a.y - cam.y - a.r - 20);
+  ctx.fillText(displayName, a.x - cam.x, a.y - cam.y - a.r - 20);
+  ctx.restore();
   }
 
   function drawFOVMask(){
@@ -618,8 +863,11 @@
       } else {
         candidates = [player, ...allies].filter(x=>x && x.alive);
       }
+    } else if(selectedMode && (selectedMode.id==='ffa'||selectedMode.id==='surv')){
+      // FFA/大逃杀：AI互相攻击，目标为所有其它活着的玩家和AI（排除自己和同队）
+      candidates = [player, ...enemies].filter(x=>x && x.alive && x!==agent && (!agent.team || x.team!==agent.team));
     } else {
-      // FFA/生存：以玩家为主要目标
+      // 其它模式
       if(player && player.alive) candidates = [player];
     }
     if(candidates.length===0) return null;
