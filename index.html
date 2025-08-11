@@ -102,9 +102,9 @@
       <div class="panel">
         <h2>设置对局</h2>
         <div id="roomSection" style="margin-bottom:16px;display:none">
-          <div style="font-weight:600;margin-bottom:6px">可加入的对局：</div>
-          <div id="roomList" style="margin-bottom:8px"></div>
-          <button id="refreshRooms" class="primary" style="margin-bottom:8px">刷新房间</button>
+          <!-- 局域网功能已隐藏 -->
+          <div style="display:none" id="roomList"></div>
+          <button id="refreshRooms" class="primary" style="display:none">刷新房间</button>
         </div>
         <div class="grid" id="modeList"></div>
         <div class="grid" id="charList"></div>
@@ -135,14 +135,19 @@
 
 <script>
 (() => {
-  // 页面加载后自动显示房间UI
+  // 隐藏局域网房间UI
   document.addEventListener('DOMContentLoaded', function() {
     const roomSection = document.getElementById('roomSection');
-    if(roomSection) roomSection.style.display = 'block';
+    if(roomSection) roomSection.style.display = 'none';
   });
   // ===== WebSocket 局域网联机核心 =====
   let ws = null;
 let remotePlayers = [];
+let remotePlayersRender = [];
+// 每个远程玩家的本地镜像状态
+let remotePlayerStates = {};
+// 立即复活按钮（全局）
+var reviveBtn = null;
   let myPlayerId = Math.random().toString(36).slice(2);
   let myName = '玩家' + myPlayerId.slice(-4);
   let currentRoomId = null;
@@ -154,7 +159,7 @@ let remotePlayers = [];
   let url = localStorage.getItem('fireline_server') || `ws://${host}:3000`;
   ws = new WebSocket(url);
     ws.onopen = ()=>{ console.log('已连接局域网服务器'); };
-    ws.onmessage = (e)=>{
+  ws.onmessage = (e)=>{
       let msg;
       try{ msg=JSON.parse(e.data); }catch{return;}
       if(msg.type==='roomList') updateRoomList(msg.rooms);
@@ -162,18 +167,27 @@ let remotePlayers = [];
       if(msg.type==='joined'){ currentRoomId=msg.roomId; isHost=false; menu.style.display='none'; startGame(); }
       if(msg.type==='playerJoin'){
         tip(msg.name+' 加入了房间');
-        // 主机收到新玩家加入，立即同步所有玩家
-        if(isHost) {
-          // 收集所有玩家（主机和remotePlayers）
-          const allPlayers = [
-            { id: myPlayerId, name: myName, x: player.x, y: player.y, r: player.r, color: player.color, hp: player.hp, hpMax: player.hpMax, alive: player.alive },
-            ...remotePlayers.filter(p=>p.id!==myPlayerId)
-          ];
-          syncToOthers({ remotePlayers: allPlayers });
-        }
+        // 主机收到新玩家加入，立即同步所有玩家（已由定时广播实现）
       }
       if(msg.type==='playerLeave'){ tip('有玩家离开'); }
-      if(msg.type==='sync' && !isHost){ onSyncFromHost(msg.data); }
+      if(msg.type==='sync'){
+        if(isHost) {
+          // 主机端合并remotePlayers，只保留非主机玩家
+          if(msg.data && msg.data.remotePlayers) {
+            msg.data.remotePlayers.forEach(p => {
+              if(p.id !== myPlayerId) {
+                const idx = remotePlayers.findIndex(x=>x.id===p.id);
+                if(idx>=0) remotePlayers[idx] = { ...remotePlayers[idx], ...p };
+                else remotePlayers.push(p);
+              }
+            });
+            // 移除已离线玩家（如有）
+            remotePlayers = remotePlayers.filter(p => p.id !== myPlayerId);
+          }
+        } else {
+          onSyncFromHost(msg.data);
+        }
+      }
     };
     ws.onclose = ()=>{ tip('与服务器断开'); };
   }
@@ -205,7 +219,33 @@ let remotePlayers = [];
   function onSyncFromHost(data) {
     // 客户端同步主机数据
     if(data && data.remotePlayers) {
-      remotePlayers = data.remotePlayers;
+      // 只在收到数据时更新本地镜像，不直接用于渲染
+      remotePlayers = data.remotePlayers.filter(p=>p.id!==myPlayerId); // 不包含自己
+      remotePlayers.forEach(p => {
+        if(!remotePlayerStates[p.id]) {
+          // 初始化本地镜像
+          remotePlayerStates[p.id] = { ...p };
+        } else {
+          // 只更新位置、血量等动态属性，保留本地对象引用
+          remotePlayerStates[p.id].x = p.x;
+          remotePlayerStates[p.id].y = p.y;
+          remotePlayerStates[p.id].hp = p.hp;
+          remotePlayerStates[p.id].hpMax = p.hpMax;
+          remotePlayerStates[p.id].alive = p.alive;
+          remotePlayerStates[p.id].color = p.color;
+          remotePlayerStates[p.id].name = p.name;
+        }
+      });
+      // 移除已离线玩家的本地镜像
+      Object.keys(remotePlayerStates).forEach(id=>{
+        if(!remotePlayers.find(p=>p.id===id)) delete remotePlayerStates[id];
+      });
+    }
+    if(data && data.enemies) {
+      enemies = data.enemies;
+    }
+    if(data && data.allies) {
+      allies = data.allies;
     }
   }
   // 页面加载自动连接
@@ -216,17 +256,7 @@ let remotePlayers = [];
   const refreshRooms = document.getElementById('refreshRooms');
   let discoveredRooms = [];
 
-  // 覆盖房间发现与加入逻辑，使用WebSocket
-  refreshRooms.onclick = ()=>{ if(ws) ws.send(JSON.stringify({ type:'getRooms' })); };
-  // 新增“创建房间”按钮
-  if(roomSection && !document.getElementById('createRoomBtn')) {
-    const btn = document.createElement('button');
-    btn.id = 'createRoomBtn';
-    btn.className = 'primary';
-    btn.textContent = '创建新房间';
-    btn.onclick = createRoomWS;
-    roomSection.insertBefore(btn, roomList);
-  }
+  // 局域网相关功能入口已隐藏
   // canvas自适应窗口
   // 采用固定逻辑分辨率，显示时自适应缩放，避免内容变形
   const LOGIC_W = 960, LOGIC_H = 720;
@@ -416,7 +446,7 @@ let remotePlayers = [];
 
     // 玩家
     const base = selectedChar || chars[1];
-    player = createAgent(800,700, base.color, base.hp, base.speed, true, 1);
+  player = createAgent(800,700, base.color, base.hp, base.speed, true, 1, myName);
     equip(base.weapon);
     player.reserve = 120; // 备用弹药
 
@@ -455,14 +485,23 @@ let remotePlayers = [];
 
     bullets=[]; grenades=[]; explosions=[]; smokes=[]; killCount=0; lastTime=performance.now(); timeStart=lastTime;
     zone.r = CONFIG.danger.radiusStart; zone.phase=0; zone.nextT = timeStart + CONFIG.danger.phases[0];
-    // 主机定时同步玩家数据
+    // 所有玩家定时上报自己状态到主机
+    setInterval(()=>{
+      if(ws && currentRoomId) {
+        const myState = { id: myPlayerId, name: myName, x: player.x, y: player.y, r: player.r, color: player.color, hp: player.hp, hpMax: player.hpMax, alive: player.alive };
+        ws.send(JSON.stringify({ type:'sync', data: { remotePlayers: [myState] }, playerId: myPlayerId }));
+      }
+    }, 100);
+
+    // 主机定时广播所有玩家状态
     if(isHost) setInterval(()=>{
-      // 收集所有玩家（主机和remotePlayers）
+      // 主机收集自己和所有 remotePlayers
       const allPlayers = [
         { id: myPlayerId, name: myName, x: player.x, y: player.y, r: player.r, color: player.color, hp: player.hp, hpMax: player.hpMax, alive: player.alive },
         ...remotePlayers.filter(p=>p.id!==myPlayerId)
       ];
-      syncToOthers({ remotePlayers: allPlayers });
+      // 同步AI
+      syncToOthers({ remotePlayers: allPlayers, enemies, allies });
     }, 100);
     requestAnimationFrame(loop);
     tip('目标：'+ selectedMode.name +'！红:回血 蓝:弹药 紫:武器');
@@ -471,23 +510,22 @@ let remotePlayers = [];
   function initTeams(){
     allies=[]; enemies=[];
     // 我方：玩家 + 1 AI
-    const ally = createAgent(900,760, '#79ffd1', 95, 2.4, false, 1);
+  const ally = createAgent(900,760, '#79ffd1', 95, 2.4, false, 1, '队友');
     ally.primary='rifle'; ally.weapon=CONFIG.weapons['rifle']; ally.mag=ally.weapon.mag; ally.reserve=90; allies.push(ally);
     // 敌方：2 AI
     spawnEnemies([{x:4800,y:3400,c:'#ffc857'},{x:5200,y:1600,c:'#a16eff'}], 2);
   }
 
   function spawnEnemies(list, team=2){
-    list.forEach(s=>{ const e=createAgent(s.x,s.y,s.c,90,2.2,false, team); e.primary='rifle'; e.weapon=CONFIG.weapons[e.primary]; e.mag=e.weapon.mag; e.reserve=90; enemies.push(e); });
+  list.forEach(s=>{ const e=createAgent(s.x,s.y,s.c,90,2.2,false, team, s.name || '敌人'); e.primary='rifle'; e.weapon=CONFIG.weapons[e.primary]; e.mag=e.weapon.mag; e.reserve=90; enemies.push(e); });
   }
 
-  function createAgent(x,y,color,hp,speed,isPlayer, team){
-    return { x,y,r:18,color,hp,hpMax:hp,speed,alive:true, team:team||2,
-      primary:'pistol', weapon:null, mag:0, reserve:0, lastFire:0, reloadEnd:0,
-      state:'patrol', target:null, vx:0, vy:0, name: name };
-  player = createAgent(800,700, base.color, base.hp, base.speed, true, 1, myName);
-  const ally = createAgent(900,760, '#79ffd1', 95, 2.4, false, 1, '队友');
-  list.forEach(s=>{ const e=createAgent(s.x,s.y,s.c,90,2.2,false, team, s.name || '敌人'); e.primary='rifle'; e.weapon=CONFIG.weapons[e.primary]; e.mag=e.weapon.mag; e.reserve=90; enemies.push(e); });
+  function createAgent(x, y, color, hp, speed, isPlayer, team, name) {
+    return {
+      x, y, r: 18, color, hp, hpMax: hp, speed, alive: true, team: team || 2,
+      primary: 'pistol', weapon: null, mag: 0, reserve: 0, lastFire: 0, reloadEnd: 0,
+      state: 'patrol', target: null, vx: 0, vy: 0, name: name
+    };
   }
 
   function equip(id){
@@ -509,13 +547,16 @@ let remotePlayers = [];
   /** 主循环 **/
   // 修正高刷新率下dt过小导致游戏加速问题，dt基于真实时间，最大不超过40ms
   function loop(t){
-    let dt = t - lastTime;
-    if (!lastTime) dt = 16.7; // 首帧
-    dt = Math.max(10, Math.min(40, dt)); // 限制dt范围，防止过快或过慢
-    lastTime = t;
-    update(dt, t);
-    render();
-    if(result.style.display!=='flex') requestAnimationFrame(loop);
+  // 每帧渲染前同步 remotePlayersRender，消除闪烁
+  // 渲染时只用本地镜像，彻底避免闪烁
+  remotePlayersRender = Object.values(remotePlayerStates);
+  let dt = t - lastTime;
+  if (!lastTime) dt = 16.7; // 首帧
+  dt = Math.max(10, Math.min(40, dt)); // 限制dt范围，防止过快或过慢
+  lastTime = t;
+  update(dt, t);
+  render();
+  if(result.style.display!=='flex') requestAnimationFrame(loop);
   }
 
   /** 更新 **/
@@ -691,16 +732,8 @@ let remotePlayers = [];
 
     // 模式信息与复活逻辑
     if(selectedMode.id==='ffa'){
-      modeInfo.textContent = '自由混战：无限复活，击败所有敌人';
-      // 死亡后自动复活
-      if(!player.alive){
-        setTimeout(()=>{
-          player.x = 800 + Math.random()*4000;
-          player.y = 700 + Math.random()*3000;
-          player.hp = player.hpMax;
-          player.alive = true;
-        }, 1200);
-      }
+  modeInfo.textContent = '自由混战：无限复活，击败所有敌人';
+  // 死亡后由按钮控制复活
     }else if(selectedMode.id==='surv'){
       modeInfo.textContent = '大逃杀：有缩圈，死亡淘汰，最后一人生存';
       // 死亡不复活
@@ -734,6 +767,32 @@ let remotePlayers = [];
   // 隐藏系统鼠标指针
   canvas.style.cursor = 'none';
   function render(){
+  // 混战模式下死亡显示立即复活按钮
+  if(selectedMode && selectedMode.id==='ffa' && !player.alive) {
+    if(!reviveBtn) {
+      reviveBtn = document.createElement('button');
+      reviveBtn.textContent = '立即复活';
+      reviveBtn.className = 'primary';
+      reviveBtn.style.position = 'absolute';
+      reviveBtn.style.left = '50%';
+      reviveBtn.style.top = '60%';
+      reviveBtn.style.transform = 'translate(-50%, -50%)';
+      reviveBtn.style.fontSize = '22px';
+      reviveBtn.style.padding = '16px 36px';
+      reviveBtn.onclick = ()=>{
+        player.x = 800 + Math.random()*4000;
+        player.y = 700 + Math.random()*3000;
+        player.hp = player.hpMax;
+        player.alive = true;
+        reviveBtn.remove();
+        reviveBtn = null;
+      };
+      document.body.appendChild(reviveBtn);
+    }
+  } else if(reviveBtn) {
+    reviveBtn.remove();
+    reviveBtn = null;
+  }
   // ...（其余渲染代码保持不变）
     // 渲染前缩放到逻辑分辨率
     ctx.setTransform(1,0,0,1,0,0);
@@ -773,11 +832,12 @@ let remotePlayers = [];
     // 角色
   enemies.forEach(e=>{ if(!e.alive) return; drawAgent(e, e.color, undefined, false, e.name || '敌人'); });
   allies.forEach(a=>{ if(!a.alive) return; drawAgent(a, '#79ffd1', undefined, false, a.name || '队友'); });
-  if(player.alive) drawAgent(player, selectedMode.id==='team2' ? '#9fd1ff' : player.color, input.aimAngle, true, player.name || myName || '玩家');
-  // 渲染远程玩家
-  if(remotePlayers && remotePlayers.length) {
-    remotePlayers.forEach(p=>{
-      if(p.alive) drawAgent(p, p.color, undefined, false, p.name || '玩家');
+  // 只渲染本地玩家自己的player对象，完全不受网络同步影响
+  if(player && player.alive) drawAgent(player, selectedMode && selectedMode.id==='team2' ? '#9fd1ff' : player.color, input.aimAngle, true, player.name || myName || '玩家');
+  // 渲染远程玩家（不包括自己）
+  if(remotePlayersRender && remotePlayersRender.length) {
+    remotePlayersRender.forEach(p=>{
+      if(p.alive && p.id !== myPlayerId) drawAgent(p, p.color, undefined, false, p.name || '玩家');
     });
   }
 
